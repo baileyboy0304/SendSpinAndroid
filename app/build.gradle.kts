@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "com.mph070770.sendspinandroid"
-        minSdk = 26
+        minSdk = 24
         targetSdk = 35
         versionCode = 4
         versionName = "0.4"
@@ -32,11 +32,11 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
     kotlinOptions {
-        jvmTarget = "17"
+        jvmTarget = "11"
     }
 
     buildFeatures {
@@ -46,20 +46,34 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.15.0")
-    implementation("androidx.activity:activity-compose:1.9.3")
+    // Core 1.9.0+ has ashmem pinning fixes and supports API 24+
+    implementation("androidx.core:core-ktx:1.9.0")
 
-    implementation("androidx.compose.ui:ui:1.7.5")
-    implementation("androidx.compose.ui:ui-tooling-preview:1.7.5")
-    implementation("androidx.compose.material3:material3:1.3.1")
-    implementation("androidx.compose.material:material-icons-extended:1.7.5")
-    debugImplementation("androidx.compose.ui:ui-tooling:1.7.5")
+    // Activity Compose 1.7.0+ supports API 24+ and works with compileSdk 31
+    implementation("androidx.activity:activity-compose:1.7.0")
 
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("org.json:json:20240303")
+    // Compose 1.0.x is the most stable for API 24+
+    implementation("androidx.compose.ui:ui:1.0.5")
+    implementation("androidx.compose.ui:ui-tooling-preview:1.0.5")
+    implementation("androidx.compose.material:material:1.0.5")
+    implementation("androidx.compose.material:material-icons-extended:1.0.5")
+    debugImplementation("androidx.compose.ui:ui-tooling:1.0.5")
+
+    // Coroutines 1.6.x for API 24+ compatibility
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4")
+
+    // OkHttp 4.11.0 supports API 21+
+    implementation("com.squareup.okhttp3:okhttp:4.11.0")
+
+    // JSON library supports API 24+
+    implementation("org.json:json:20231013")
+
+    // Concentus library
     implementation("io.github.jaredmdobson:concentus:1.0.2")
 
-    implementation("androidx.media:media:1.7.0")
+    // FLAC support can be added later with proper library selection
+    // Currently supporting: Opus (via Concentus) and PCM
 
+    // androidx.media 1.6.0+ has ashmem pinning fixes and supports API 14+
+    implementation("androidx.media:media:1.6.0")
 }

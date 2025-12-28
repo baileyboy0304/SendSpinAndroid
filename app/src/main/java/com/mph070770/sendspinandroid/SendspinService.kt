@@ -1,12 +1,21 @@
 package com.mph070770.sendspinandroid
 
 import android.app.*
-import android.content.Context
+import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Intent
-import android.graphics.Bitmap
-import android.os.Binder
+import android.content.IntentFilter
+import android.content.res.Configuration
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
+import android.content.Context
+import android.os.Binder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -25,6 +34,56 @@ class SendspinService : Service() {
 
     private val _uiState = MutableStateFlow(PlayerViewModel.UiState())
     val uiState: StateFlow<PlayerViewModel.UiState> = _uiState
+
+    // Detect low-memory devices to disable expensive features (initialized in onCreate)
+    private var isLowMemoryDevice = false
+    private var isTV = false
+    
+    private fun checkIsLowMemoryDevice(): Boolean {
+        return try {
+            val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            val memInfo = ActivityManager.MemoryInfo()
+            activityManager?.getMemoryInfo(memInfo)
+            val lowMemory = memInfo?.totalMem ?: 0L < 2_000_000_000L  // Less than 2GB total RAM
+            if (lowMemory) {
+                Log.i(tag, "Low-memory device detected: disabling artwork and action buttons")
+            }
+            lowMemory
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to check device memory", e)
+            false
+        }
+    }
+
+    private fun checkIsTV(): Boolean {
+        return try {
+            val uiMode = resources.configuration.uiMode
+            val isTV = (uiMode and Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION
+            if (isTV) {
+                Log.i(tag, "TV device detected: using simplified UI and auto-discovery")
+            }
+            isTV
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to check device type", e)
+            false
+        }
+    }
+
+    // Track notification state to avoid redundant updates
+    private var lastNotificationState: NotificationState? = null
+
+    // Network connectivity receiver for auto-reconnect
+    private var connectivityReceiver: BroadcastReceiver? = null
+    private var lastNetworkState: Boolean = false
+
+    private data class NotificationState(
+        val trackTitle: String?,
+        val trackArtist: String?,
+        val playbackState: String?,
+        val hasController: Boolean,
+        val supportedCommands: Set<String>,
+        val artworkBitmap: Any? // Using Any to avoid bitmap comparison issues
+    )
 
     companion object {
         private const val NOTIFICATION_ID = 1001
@@ -55,6 +114,11 @@ class SendspinService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.i(tag, "Service created")
+        
+        // Initialize low-memory detection now that context is ready
+        isTV = checkIsTV()
+        isLowMemoryDevice = checkIsLowMemoryDevice()
+        
         createNotificationChannel()
 
         // Acquire wake lock to keep CPU running during playback
@@ -65,11 +129,13 @@ class SendspinService : Service() {
         ).apply {
             setReferenceCounted(false)
         }
+
+        // Register network connectivity receiver
+        registerNetworkReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(tag, "Service started")
-
         // Start foreground immediately
         startForeground(NOTIFICATION_ID, createNotification())
 
@@ -87,14 +153,19 @@ class SendspinService : Service() {
             connect(wsUrl, clientId, clientName)
         }
 
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent?): IBinder? {
+        return binder
+    }
 
     override fun onDestroy() {
         Log.i(tag, "Service destroyed")
         disconnect()
+
+        // Unregister network connectivity receiver
+        unregisterNetworkReceiver()
 
         // Release wake lock
         wakeLock?.let {
@@ -113,10 +184,11 @@ class SendspinService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Sendspin Playback",
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "Sendspin music playback"
+                description = "Sendspin music playback - keeps service running"
                 setShowBadge(false)
+                enableVibration(false)
             }
 
             val notificationManager = getSystemService(NotificationManager::class.java)
@@ -134,22 +206,40 @@ class SendspinService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Always show track info if available, fallback to status
+        val title = if (state.trackTitle.isNullOrBlank()) "Sendspin Player" else state.trackTitle
+        val subtitle = if (state.trackArtist.isNullOrBlank()) {
+            when {
+                state.connected && state.trackTitle != null -> "Now Playing"
+                state.connected -> "Connected"
+                else -> "Not connected"
+            }
+        } else {
+            state.trackArtist
+        }
+
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(state.trackTitle ?: "Sendspin Player")
-            .setContentText(state.trackArtist ?: "Not playing")
+            .setContentTitle(title)
+            .setContentText(subtitle)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(contentIntent)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setShowWhen(false)
 
-        // Add album art if available
-        state.artworkBitmap?.let { bitmap ->
-            builder.setLargeIcon(bitmap)
+        // Add album art only on non-low-memory devices
+        if (!isLowMemoryDevice) {
+            state.artworkBitmap?.let { bitmap ->
+                builder.setLargeIcon(bitmap)
+            }
         }
 
-        // Add media controls
-        if (state.hasController) {
+        // Track which action indices we add
+        val actionIndices = mutableListOf<Int>()
+
+        // Add media controls only on non-low-memory devices
+        if (!isLowMemoryDevice && state.hasController) {
             // Previous
             if (state.supportedCommands.contains("previous")) {
                 val prevIntent = createMediaActionIntent("previous")
@@ -158,6 +248,7 @@ class SendspinService : Service() {
                     "Previous",
                     prevIntent
                 )
+                actionIndices.add(actionIndices.size)
             }
 
             // Play/Pause
@@ -168,6 +259,7 @@ class SendspinService : Service() {
                     "Pause",
                     pauseIntent
                 )
+                actionIndices.add(actionIndices.size)
             } else if (state.supportedCommands.contains("play")) {
                 val playIntent = createMediaActionIntent("play")
                 builder.addAction(
@@ -175,6 +267,7 @@ class SendspinService : Service() {
                     "Play",
                     playIntent
                 )
+                actionIndices.add(actionIndices.size)
             }
 
             // Next
@@ -185,12 +278,15 @@ class SendspinService : Service() {
                     "Next",
                     nextIntent
                 )
+                actionIndices.add(actionIndices.size)
             }
         }
 
-        // Use media style
+        // Use media style with only the actions that were actually added
         val mediaStyle = androidx.media.app.NotificationCompat.MediaStyle()
-            .setShowActionsInCompactView(0, 1, 2)
+        if (actionIndices.isNotEmpty()) {
+            mediaStyle.setShowActionsInCompactView(*actionIndices.toIntArray())
+        }
         builder.setStyle(mediaStyle)
 
         return builder.build()
@@ -209,8 +305,22 @@ class SendspinService : Service() {
     }
 
     private fun updateNotification() {
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, createNotification())
+        val state = _uiState.value
+        val currentState = NotificationState(
+            trackTitle = state.trackTitle,
+            trackArtist = state.trackArtist,
+            playbackState = state.playbackState,
+            hasController = state.hasController,
+            supportedCommands = state.supportedCommands,
+            artworkBitmap = state.artworkBitmap
+        )
+
+        // Only update notification if something relevant changed
+        if (lastNotificationState != currentState) {
+            lastNotificationState = currentState
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.notify(NOTIFICATION_ID, createNotification())
+        }
     }
 
     fun connect(wsUrl: String, clientId: String, clientName: String) {
@@ -306,5 +416,90 @@ class SendspinService : Service() {
 
     fun clearPlayerMutedFlag() {
         _uiState.value = _uiState.value.copy(playerMutedFromServer = false)
+    }
+
+    // Network connectivity monitoring
+    private fun registerNetworkReceiver() {
+        connectivityReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val isCurrentlyConnected = isNetworkAvailable()
+                
+                // Only act on state changes
+                if (isCurrentlyConnected != lastNetworkState) {
+                    lastNetworkState = isCurrentlyConnected
+                    
+                    if (isCurrentlyConnected) {
+                        Log.i(tag, "Network restored, attempting auto-reconnect")
+                        // Get current connection parameters
+                        val currentState = _uiState.value
+                        if (!currentState.wsUrl.isBlank() && 
+                            !currentState.clientId.isBlank() && 
+                            !currentState.clientName.isBlank()) {
+                            // Reconnect with existing parameters
+                            scope.launch {
+                                // Give network a moment to stabilize
+                                delay(1000)
+                                connect(currentState.wsUrl, currentState.clientId, currentState.clientName)
+                            }
+                        }
+                    } else {
+                        Log.i(tag, "Network lost")
+                        updateUiState { it.copy(status = "network_lost", connected = false) }
+                    }
+                }
+            }
+        }
+
+        try {
+            val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                registerReceiver(connectivityReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(connectivityReceiver, filter)
+            }
+            
+            // Initialize network state
+            lastNetworkState = isNetworkAvailable()
+            Log.i(tag, "Network receiver registered. Current state: $lastNetworkState")
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to register network receiver", e)
+        }
+    }
+
+    private fun unregisterNetworkReceiver() {
+        connectivityReceiver?.let {
+            try {
+                unregisterReceiver(it)
+                Log.i(tag, "Network receiver unregistered")
+            } catch (e: Exception) {
+                Log.w(tag, "Failed to unregister network receiver", e)
+            }
+        }
+        connectivityReceiver = null
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        return try {
+            val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val network = connectivityManager.activeNetwork ?: return false
+                val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+                
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            } else {
+                @Suppress("DEPRECATION")
+                val networkInfo = connectivityManager.activeNetworkInfo
+                networkInfo?.isConnectedOrConnecting == true
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Error checking network availability", e)
+            false
+        }
+    }
+
+    private fun updateUiState(block: (PlayerViewModel.UiState) -> PlayerViewModel.UiState) {
+        _uiState.value = block(_uiState.value)
     }
 }

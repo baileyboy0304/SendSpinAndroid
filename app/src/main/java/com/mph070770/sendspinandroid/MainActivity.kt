@@ -1,15 +1,20 @@
 package com.mph070770.sendspinandroid
 
+import android.Manifest
+import android.content.res.Configuration
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
+import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -18,13 +23,48 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
+import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
 
 class MainActivity : ComponentActivity() {
     private val vm: PlayerViewModel by viewModels()
+    
+    private val nearbyWifiPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        // Permission grant result will be handled by the system
+        // NSD discovery will start or continue based on permission grant
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Ensure system bars remain visible and don't draw behind them
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+        
+        // Check if this is a TV device
+        val isTV = (resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION
+        
+        // For TV devices, enable auto-discovery mode and auto-connect to first server
+        if (isTV) {
+            // Request permissions and start auto-discovery
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+            // TV will auto-connect when first server is discovered (handled in PlayerScreen)
+        } else {
+            // For phones/tablets, use saved connection or manual discovery
+            val prefs = getSharedPreferences("SendspinPlayerPrefs", android.content.Context.MODE_PRIVATE)
+            val savedWsUrl = prefs.getString("ws_url", null)
+            val savedClientName = prefs.getString("client_name", null)
+            
+            if (!savedWsUrl.isNullOrBlank() && !savedClientName.isNullOrBlank() && savedWsUrl != "ws://192.168.1.137:8927/sendspin") {
+                // Auto-connect with saved parameters
+                vm.connect(savedWsUrl, savedClientName)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        }
 
         setContent {
             MaterialTheme {
@@ -47,45 +87,87 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun PlayerScreen(vm: PlayerViewModel) {
     val ui by vm.ui.collectAsState()
+    val discoveredServers by vm.discoveredServers.collectAsState()
+
+    // Sync with system volume when UI is shown
+    LaunchedEffect(Unit) {
+        vm.updateAndroidVolumeState()
+    }
+
+    // On TV devices, auto-connect to first discovered server
+    var autoConnectAttempted by remember { mutableStateOf(false) }
+    LaunchedEffect(discoveredServers, ui.isTV, ui.connected) {
+        if (ui.isTV && !ui.connected && !autoConnectAttempted && discoveredServers.isNotEmpty()) {
+            autoConnectAttempted = true
+            val firstServer = discoveredServers.first()
+            vm.connect(firstServer.url, "Android TV")
+        }
+    }
 
     var wsUrl by remember { mutableStateOf(ui.wsUrl) }
-    var clientId by remember { mutableStateOf(ui.clientId) }
     var clientName by remember { mutableStateOf(ui.clientName) }
+    var showServerPicker by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Sendspin Player", style = MaterialTheme.typography.titleLarge)
+        Text("Sendspin Player", style = MaterialTheme.typography.h5)
 
-        OutlinedTextField(
-            value = wsUrl,
-            onValueChange = { wsUrl = it },
-            label = { Text("WebSocket URL (ws://host:port/sendspin)") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
+        // On non-TV devices, show server discovery UI
+        if (!ui.isTV) {
+            // Discovered servers list
+            if (!ui.connected) {
+                if (discoveredServers.isNotEmpty()) {
+                    Text("Available Servers:", style = MaterialTheme.typography.body2)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, MaterialTheme.colors.surface)
+                    ) {
+                        discoveredServers.forEach { server ->
+                            Button(
+                                onClick = {
+                                    wsUrl = server.url
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(4.dp)
+                            ) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Text(server.name, style = MaterialTheme.typography.caption)
+                                    Text(server.url, style = MaterialTheme.typography.overline, fontSize = 10.sp)
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                } else {
+                    Text("Searching for Sendspin servers...", style = MaterialTheme.typography.body2, color = MaterialTheme.colors.primary)
+                }
+                OutlinedTextField(
+                    value = wsUrl,
+                    onValueChange = { wsUrl = it },
+                    label = { Text("WebSocket URL (ws://host:port/sendspin)") },
+                    singleLine = true,
+                    enabled = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedTextField(
-                value = clientId,
-                onValueChange = { clientId = it },
-                label = { Text("client_id") },
-                singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
-            OutlinedTextField(
-                value = clientName,
-                onValueChange = { clientName = it },
-                label = { Text("name") },
-                singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
+                OutlinedTextField(
+                    value = clientName,
+                    onValueChange = { clientName = it },
+                    label = { Text("name") },
+                    singleLine = true,
+                    enabled = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(
-                onClick = { vm.connect(wsUrl.trim(), clientId.trim(), clientName.trim()) },
+                onClick = { vm.connect(wsUrl.trim(), clientName.trim()) },
                 enabled = !ui.connected
             ) { Text("Connect") }
 
@@ -99,15 +181,23 @@ private fun PlayerScreen(vm: PlayerViewModel) {
 
         Text("Status: ${ui.status}", maxLines = 2, overflow = TextOverflow.Ellipsis)
         Text("Roles: ${ui.activeRoles.ifBlank { "-" }}")
-        Text("Group: ${ui.groupName.ifBlank { "-" }} (${ui.playbackState.ifBlank { "-" }})")
+        
+        // Hide group info on low-memory and TV devices
+        if (!ui.isLowMemoryDevice && !ui.isTV) {
+            Text("Group: ${ui.groupName.ifBlank { "-" }} (${ui.playbackState.ifBlank { "-" }})")
+        } else if (ui.isLowMemoryDevice && !ui.isTV) {
+            Text("Low memory device detected, group, metadata, playback and controller info hidden.")
+        } else if (ui.isTV) {
+            Text("TV mode: Auto-discovery enabled, metadata and UI simplified for remote control.")
+        }
 
-        // Metadata Display with Album Art
-        if (ui.hasMetadata && ui.trackTitle != null) {
+        // Metadata Display with Album Art - hidden on low-memory and TV devices
+        if (ui.hasMetadata && ui.trackTitle != null && !ui.isLowMemoryDevice && !ui.isTV) {
             Divider()
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                elevation = 4.dp
             ) {
                 Row(
                     modifier = Modifier.padding(16.dp),
@@ -132,7 +222,7 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                             modifier = Modifier
                                 .size(120.dp)
                                 .clip(RoundedCornerShape(8.dp)),
-                            color = MaterialTheme.colorScheme.surfaceVariant
+                            color = MaterialTheme.colors.surface
                         ) {
                             Icon(
                                 Icons.Default.MusicNote,
@@ -140,7 +230,7 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .padding(32.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                tint = MaterialTheme.colors.onSurface
                             )
                         }
                     }
@@ -149,15 +239,15 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "Now Playing",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            style = MaterialTheme.typography.caption,
+                            color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                         )
 
                         Spacer(modifier = Modifier.height(4.dp))
 
                         Text(
                             text = ui.trackTitle ?: "Unknown Track",
-                            style = MaterialTheme.typography.titleMedium,
+                            style = MaterialTheme.typography.h6,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -165,16 +255,16 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                         if (ui.trackArtist != null) {
                             Text(
                                 text = ui.trackArtist!!,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                style = MaterialTheme.typography.body2,
+                                color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                             )
                         }
 
                         if (ui.albumTitle != null) {
                             Text(
                                 text = ui.albumTitle!!,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.caption,
+                                color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -187,16 +277,16 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                             if (ui.trackYear != null) {
                                 Text(
                                     text = ui.trackYear.toString(),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    style = MaterialTheme.typography.overline,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                                 )
                             }
 
                             if (ui.trackNumber != null) {
                                 Text(
                                     text = "Track ${ui.trackNumber}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    style = MaterialTheme.typography.overline,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                                 )
                             }
                         }
@@ -217,58 +307,79 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                     modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp)
                 ) {
                     if (ui.repeatMode != null && ui.repeatMode != "off") {
-                        AssistChip(
-                            onClick = { },
-                            label = {
+                        Surface(
+                            color = MaterialTheme.colors.primary.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.padding(4.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    if (ui.repeatMode == "one") Icons.Default.RepeatOne else Icons.Default.Repeat,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colors.primary
+                                )
                                 Text(
                                     when (ui.repeatMode) {
                                         "one" -> "Repeat One"
                                         "all" -> "Repeat All"
                                         else -> "Repeat"
                                     },
-                                    style = MaterialTheme.typography.labelSmall
-                                )
-                            },
-                            leadingIcon = {
-                                Icon(
-                                    if (ui.repeatMode == "one") Icons.Default.RepeatOne else Icons.Default.Repeat,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
+                                    style = MaterialTheme.typography.caption
                                 )
                             }
-                        )
+                        }
                     }
 
                     if (ui.shuffleEnabled == true) {
-                        AssistChip(
-                            onClick = { },
-                            label = { Text("Shuffle", style = MaterialTheme.typography.labelSmall) },
-                            leadingIcon = {
+                        Surface(
+                            color = MaterialTheme.colors.primary.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.padding(4.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Icon(
                                     Icons.Default.Shuffle,
                                     contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colors.primary
                                 )
+                                Text("Shuffle", style = MaterialTheme.typography.caption)
                             }
-                        )
+                        }
                     }
 
                     if (ui.playbackSpeed != null && ui.playbackSpeed != 1000) {
                         val speed = ui.playbackSpeed!! / 1000.0
-                        AssistChip(
-                            onClick = { },
-                            label = { Text("${speed}x", style = MaterialTheme.typography.labelSmall) }
-                        )
+                        Surface(
+                            color = MaterialTheme.colors.primary.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.padding(4.dp)
+                        ) {
+                            Text(
+                                "${speed}x",
+                                style = MaterialTheme.typography.caption,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
+                        }
                     }
                 }
             }
         }
 
-        // Controller Section
-        if (ui.hasController) {
+        // Controller Section - hidden on low-memory and TV devices
+        if (ui.hasController && !ui.isLowMemoryDevice && !ui.isTV) {
             Divider()
 
-            Text("Group Controls", style = MaterialTheme.typography.titleMedium)
+            Text("Group Controls", style = MaterialTheme.typography.h6)
 
             // Transport Controls
             Row(
@@ -314,7 +425,7 @@ private fun PlayerScreen(vm: PlayerViewModel) {
 
             // Group Volume Control
             if (ui.supportedCommands.contains("volume")) {
-                Text("Group Volume", style = MaterialTheme.typography.bodyMedium)
+                Text("Group Volume", style = MaterialTheme.typography.body1)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -341,11 +452,11 @@ private fun PlayerScreen(vm: PlayerViewModel) {
             }
         }
 
-        // Player (Local Device) Volume Control - shown when connected with player role
-        if (ui.connected && ui.activeRoles.contains("player")) {
+        // Player (Local Device) Volume Control - shown when connected with player role (hidden on low-memory and TV devices)
+        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice && !ui.isTV) {
             Divider()
 
-            Text("Local Player Volume", style = MaterialTheme.typography.titleMedium)
+            Text("Local Player Volume", style = MaterialTheme.typography.h6)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -369,12 +480,20 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                 )
             }
         }
+        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice && !ui.isTV) {
+            Divider()
 
-        Divider()
-
-        Text("Stream: ${ui.streamDesc.ifBlank { "-" }}")
-        Text("Clock: offset=${ui.offsetUs}us drift=${String.format("%.3f", ui.driftPpm)}ppm rtt~${ui.rttUs}us")
-        Text("Buffer: queued=${ui.queuedChunks} chunks, ahead~${ui.bufferAheadMs}ms, lateDrops=${ui.lateDrops}")
+            Text("Stream: ${ui.streamDesc.ifBlank { "-" }}")
+            Text(
+                "Clock: offset=${ui.offsetUs}us drift=${
+                    String.format(
+                        "%.3f",
+                        ui.driftPpm
+                    )
+                }ppm rtt~${ui.rttUs}us"
+            )
+            Text("Buffer: queued=${ui.queuedChunks} chunks, ahead~${ui.bufferAheadMs}ms, lateDrops=${ui.lateDrops}")
+        }
 
         // Playout offset knob
         Text("Playout offset: ${ui.playoutOffsetMs}ms  (neg = earlier / catch up)")
@@ -388,25 +507,20 @@ private fun PlayerScreen(vm: PlayerViewModel) {
 
         Spacer(Modifier.weight(1f))
         Text(
-            "Sendspin Android Player v${BuildConfig.VERSION_NAME} | Opus/PCM with controller, metadata & artwork",
-            style = MaterialTheme.typography.bodySmall
+            "Sendspin Android Player v${BuildConfig.VERSION_NAME} | Opus/PCM",
+            style = MaterialTheme.typography.caption
         )
     }
 }
 
 @Composable
 private fun TrackProgressBar(vm: PlayerViewModel, ui: PlayerViewModel.UiState) {
-    // Update progress every 200ms for smooth display
-    var currentProgress by remember { mutableStateOf(0L) }
-
-    LaunchedEffect(ui.trackProgress, ui.playbackSpeed, ui.metadataTimestamp, ui.offsetUs) {
-        while (true) {
-            // Calculate current server time using clock offset
-            val nowLocalUs = System.nanoTime() / 1000L
-            val serverTimeUs = nowLocalUs + ui.offsetUs
-            currentProgress = vm.getCurrentTrackPosition(serverTimeUs) ?: 0L
-            delay(200)
-        }
+    // Calculate current progress WITHOUT triggering recompositions
+    // Only the progress indicator and text recompose, not the whole UI
+    val currentProgress = remember(ui.trackProgress, ui.playbackSpeed, ui.metadataTimestamp, ui.offsetUs) {
+        val nowLocalUs = System.nanoTime() / 1000L
+        val serverTimeUs = nowLocalUs + ui.offsetUs
+        vm.getCurrentTrackPosition(serverTimeUs) ?: 0L
     }
 
     Column {
@@ -425,27 +539,26 @@ private fun TrackProgressBar(vm: PlayerViewModel, ui: PlayerViewModel.UiState) {
         ) {
             Text(
                 text = formatDuration(currentProgress),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                style = MaterialTheme.typography.caption,
+                color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
             )
 
             if (ui.trackDuration != null && ui.trackDuration!! > 0) {
                 Text(
                     text = formatDuration(ui.trackDuration!!),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    style = MaterialTheme.typography.caption,
+                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                 )
             } else {
                 Text(
                     text = "Live",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    style = MaterialTheme.typography.caption,
+                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                 )
             }
         }
     }
 }
-
 private fun formatDuration(ms: Long): String {
     val totalSeconds = (ms / 1000).toInt()
     val minutes = totalSeconds / 60

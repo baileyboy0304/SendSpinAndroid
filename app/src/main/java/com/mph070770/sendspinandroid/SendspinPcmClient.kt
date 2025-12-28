@@ -1,5 +1,6 @@
 package com.mph070770.sendspinandroid
 
+import android.app.ActivityManager
 import android.util.Log
 import kotlinx.coroutines.*
 import okhttp3.*
@@ -27,6 +28,25 @@ class SendspinPcmClient(
 
     private val isConnected = AtomicBoolean(false)
     private var handshakeComplete: Boolean = false
+    
+    // Detect low-memory devices to disable expensive features
+    private val isLowMemoryDevice = checkIsLowMemoryDevice()
+    
+    private fun checkIsLowMemoryDevice(): Boolean {
+        return try {
+            val activityManager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? ActivityManager
+            val memInfo = ActivityManager.MemoryInfo()
+            activityManager?.getMemoryInfo(memInfo)
+            val lowMemory = memInfo?.totalMem ?: 0L < 2_000_000_000L  // Less than 2GB total RAM
+            if (lowMemory) {
+                Log.i(tag, "Low-memory device detected: disabling metadata, artwork, and action buttons")
+            }
+            lowMemory
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to check device memory", e)
+            false
+        }
+    }
 
     private val clock = ClockSync()
     private val jitter = AudioJitterBuffer()
@@ -45,8 +65,13 @@ class SendspinPcmClient(
 
     private var playAtServerUs: Long = Long.MIN_VALUE
 
-    // Pipeline delay offset (µs). Compensates for Android audio pipeline latency.
+    // Pipeline delay offset (µs). Compensates for Android audio pipeline latency + codec decode latency.
     @Volatile private var playoutOffsetUs: Long = -120_000L  // Default -120ms
+    
+    // Track codec decode latency to adjust playoutOffsetUs dynamically
+    private var decodeLatencyUs: Long = 0L  // Running average of decode time
+    private val decodeLatencySamples = mutableListOf<Long>()
+    private val maxDecodeLatencySamples = 30  // Keep rolling average of last 30 frames
 
     // Track last sent error state to prevent spam
     private var lastErrorStateSent: Long = 0L
@@ -134,6 +159,21 @@ class SendspinPcmClient(
         }
     }
 
+    /**
+     * Measure and track decode latency for compensation.
+     * Updates decodeLatencyUs with rolling average of codec decode times.
+     * This ensures playback timing accounts for actual codec processing delay.
+     */
+    private fun recordDecodeLatency(decodeTimeUs: Long) {
+        decodeLatencySamples.add(decodeTimeUs)
+        if (decodeLatencySamples.size > maxDecodeLatencySamples) {
+            decodeLatencySamples.removeAt(0)
+        }
+        
+        // Calculate moving average
+        decodeLatencyUs = decodeLatencySamples.average().toLong()
+    }
+
     private fun sendJson(type: String, payload: JSONObject) {
         val obj = JSONObject().put("type", type).put("payload", payload)
         val json = obj.toString()
@@ -176,19 +216,31 @@ class SendspinPcmClient(
             .put("client_id", clientId)
             .put("name", clientName)
             .put("version", 1)
+            .put("device_info", JSONObject()
+                .put("product_name", android.os.Build.MODEL)
+                .put("manufacturer", android.os.Build.MANUFACTURER)
+                .put("software_version", context.packageManager.getPackageInfo(context.packageName, 0).versionName))
             .put("supported_roles", JSONArray()
                 .put("player@v1")
                 .put("controller@v1")
                 .put("metadata@v1")
-                .put("artwork@v1"))
+                .apply {
+                    // Only declare artwork support on non-low-memory devices
+                    if (!isLowMemoryDevice) {
+                        put("artwork@v1")
+                    }
+                })
 
         val playerSupport = buildPlayerSupportObject()
         hello.put("player@v1_support", playerSupport)
         hello.put("player_support", playerSupport)  // Legacy field for compatibility
 
-        val artworkSupport = buildArtworkSupportObject()
-        hello.put("artwork@v1_support", artworkSupport)
-        hello.put("artwork_support", artworkSupport)  // Legacy field for compatibility
+        // Only declare artwork support on non-low-memory devices
+        if (!isLowMemoryDevice) {
+            val artworkSupport = buildArtworkSupportObject()
+            hello.put("artwork@v1_support", artworkSupport)
+            hello.put("artwork_support", artworkSupport)  // Legacy field for compatibility
+        }
 
         sendJson("client/hello", hello)
         onUiUpdate { it.copy(status = "sent client/hello") }
@@ -265,7 +317,7 @@ class SendspinPcmClient(
                     tag,
                     "stats: offset=${clock.estimatedOffsetUs()}us drift=${String.format("%.3f", clock.estimatedDriftPpm())}ppm " +
                             "rtt~=${clock.estimatedRttUs()}us queued=${snapshot.queuedChunks} ahead~=${snapshot.bufferAheadMs}ms " +
-                            "codec=$codec playoutOffset=${playoutOffsetUs / 1000}ms"
+                            "codec=$codec decodeLatency=${decodeLatencyUs / 1000}µs playoutOffset=${playoutOffsetUs / 1000}ms"
                 )
                 delay(3000L)
             }
@@ -363,9 +415,12 @@ class SendspinPcmClient(
                     continue
                 }
 
-                // Decode if Opus
+                // Decode if Opus, measuring latency
                 val pcmData = if (codec == "opus") {
-                    opusDecoder?.decode(chunk.pcmData) ?: ByteArray(0)
+                    val decodeStart = nowUs()
+                    val decoded = opusDecoder?.decode(chunk.pcmData) ?: ByteArray(0)
+                    recordDecodeLatency(nowUs() - decodeStart)
+                    decoded
                 } else {
                     chunk.pcmData
                 }
@@ -379,7 +434,10 @@ class SendspinPcmClient(
                     if (playAtServerUs != Long.MIN_VALUE) maxOf(chunk.serverTimestampUs, playAtServerUs)
                     else chunk.serverTimestampUs
 
-                val localPlayUs = (effectiveServerTsUs - offUs) + playoutOffsetUs
+                // Calculate effective playout offset: pipeline delay + measured codec decode latency
+                val totalPlayoutOffsetUs = playoutOffsetUs - decodeLatencyUs
+
+                val localPlayUs = (effectiveServerTsUs - offUs) + totalPlayoutOffsetUs
                 val now = nowUs()
                 val earlyUs = localPlayUs - now
 
@@ -389,7 +447,10 @@ class SendspinPcmClient(
                     while (true) {
                         val next = jitter.pollPlayable(nowUs(), offUs, Long.MAX_VALUE) ?: break
                         val nextPcm = if (codec == "opus") {
-                            opusDecoder?.decode(next.pcmData) ?: ByteArray(0)
+                            val decodeStart = nowUs()
+                            val decoded = opusDecoder?.decode(next.pcmData) ?: ByteArray(0)
+                            recordDecodeLatency(nowUs() - decodeStart)
+                            decoded
                         } else {
                             next.pcmData
                         }
@@ -568,8 +629,8 @@ class SendspinPcmClient(
 
                                 newState = newState.copy(artworkUrl = artworkUrl)
 
-                                // If the artwork URL changed or we don't have artwork yet, fetch it
-                                if (artworkUrl != currentUrl && artworkUrl != null) {
+                                // Only fetch artwork on non-low-memory devices
+                                if (!isLowMemoryDevice && artworkUrl != currentUrl && artworkUrl != null) {
                                     // Clear old bitmap when URL changes
                                     if (currentUrl != null) {
                                         newState = newState.copy(artworkBitmap = null)
